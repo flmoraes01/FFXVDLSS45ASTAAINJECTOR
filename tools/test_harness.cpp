@@ -6,7 +6,6 @@
 #include <d3dcompiler.h>
 #include <cstdio>
 #include <cmath>
-#include <cstring>
 #include "nvsdk_ngx.h"
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3dcompiler.lib")
@@ -80,20 +79,6 @@ int main()
     wchar_t dir[MAX_PATH]; GetModuleFileNameW(nullptr, dir, MAX_PATH); *wcsrchr(dir, L'\\') = 0;
     wchar_t mod[MAX_PATH]; swprintf(mod, MAX_PATH, L"%s\\winmm.dll", dir);
     if (!LoadLibraryW(mod)) { printf("cannot load mod\n"); return 1; }
-
-    // 50 % resolution scale in GraphicsConfig.ini reaches the game as 58 % (DLSS Balanced).
-    {
-        char ini[MAX_PATH]; GetModuleFileNameA(nullptr, ini, MAX_PATH); strcpy(strrchr(ini, '\\'), "\\GraphicsConfig.ini");
-        FILE* f = fopen(ini, "wb");
-        fputs("[BasicSettings]\r\nDisplayResolutionWH=3440x1440\r\nRenderingResolutionRatio=50\r\nShowFPS=0\r\n", f);
-        fclose(f);
-        char text[256] = {}; f = fopen(ini, "rb"); fread(text, 1, sizeof(text) - 1, f); fclose(f);
-        UINT viaProfile = GetPrivateProfileIntA("BasicSettings", "RenderingResolutionRatio", 0, ini);
-        bool crt = strstr(text, "RenderingResolutionRatio=58\r\n") != nullptr;
-        printf("GraphicsConfig ratio 50 -> crt %s, GetPrivateProfileIntA %u\n", crt ? "58" : "unchanged", viaProfile);
-        DeleteFileA(ini);
-        if (!crt || viaProfile != 58) return 1;
-    }
 
     ID3D11Device* dev; ID3D11DeviceContext* ctx;
     CHECK(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &dev, nullptr, &ctx));

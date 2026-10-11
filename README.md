@@ -55,10 +55,10 @@ TAA mode (`ReplaceTAA=1`):
   jittered frame through and stages its inputs, and DLSS upscales at that draw, so the
   resolution scale works like a DLSS quality mode (75 % ≈ Quality, 50 % = Balanced).
   At 100 % DLSS runs at the TAA pass as DLAA.
-* The menu's 50 % is DLSS Balanced: when `GraphicsConfig.ini` says `RenderingResolutionRatio=50`, the
-  mod hands the game 58 while it reads the file (ntdll read hooks), and the menu keeps showing 50 %. The
-  file is only read at startup, so after choosing 50 % in the menu, restart the game. For DLSS
-  Performance, write `RenderingResolutionRatio=49` in the file (the game accepts any percentage).
+* The menu's 50 % is DLSS Balanced: the mod hooks the game's settings loader and the function that
+  applies the settings (startup and every menu change) and turns a 50 % scale into 58 %. It applies
+  immediately; the menu keeps showing 50 %. Both functions are matched by their first bytes, so a
+  different game build simply keeps 50 % (logged). The game only accepts 50..200 %.
 
 ## OptiScaler (DLSS-NR)
 

@@ -23,10 +23,8 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
-#include <winternl.h>
 #include <d3d11_3.h>
 #include <d3dcompiler.h>
-#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdarg>
@@ -1181,6 +1179,7 @@ struct DlssInstance {
     NVSDK_NGX_Handle* handle = nullptr;
     NVSDK_NGX_Parameter* params = nullptr;
     UINT inW = 0, inH = 0, outW = 0, outH = 0; int flags = 0, preset = 0;
+    UINT64 evals = 0;   // evaluations since creation (verbose log)
     void Release()
     {
         if (handle) NVSDK_NGX_D3D11_ReleaseFeature(handle);
@@ -1244,6 +1243,7 @@ static bool EnsureDlss(ID3D11DeviceContext* ctx, UINT inW, UINT inH, UINT outW, 
         return false;
     }
     g_dlss.inW = inW; g_dlss.inH = inH; g_dlss.outW = outW; g_dlss.outH = outH; g_dlss.flags = flags; g_dlss.preset = preset;
+    g_dlss.evals = 0;
     Log("DLSS created: %ux%u -> %ux%u quality=%d flags=0x%X preset=%d", inW, inH, outW, outH, cp.Feature.InPerfQualityValue, flags, preset);
     LogDlssVersion();
     return true;
@@ -1463,7 +1463,7 @@ static bool EvaluateDlss(ID3D11DeviceContext* ctx, ID3D11Resource* color, ID3D11
     ep.InExposureScale = 1.0f;
     NVSDK_NGX_Result r;
     Isolated(ctx, [&] { r = NGX_D3D11_EVALUATE_DLSS_EXT(ctx, g_dlss.handle, g_dlss.params, &ep); });
-    static UINT64 evals; ++evals;
+    UINT64 evals = ++g_dlss.evals;
     if (NVSDK_NGX_FAILED(r)) { Log("DLSS evaluate failed 0x%08X", r); return false; }
     if (evals <= 2 || (g_cfg.verbose && evals <= 400))
         Log("DLSS eval #%llu: %ux%u -> %ux%u jitter=(%.4f, %.4f) mvScale=(%g, %g) reset=%d depth=%d mv=%d",
@@ -1905,82 +1905,58 @@ static bool HookExeImport(const char* dll, const char* func, void* hook, void** 
 
 // ------------------------------------------------------------------------------------------
 // 50 % resolution scale = DLSS Balanced
-// The game's menu offers 50 / 75 / 100 % and accepts any percentage from GraphicsConfig.ini.
-// When the file says 50, the game is handed 58 (DLSS Balanced) instead; the menu still shows
-// 50 %. The file is read at startup only, so choosing 50 % in the menu applies after a restart.
-// Hooked at ntdll level so every way of reading the file (CRT, ReadFile, GetPrivateProfile*) is seen.
+// The game keeps the resolution scale as a percentage in its graphics settings object (offset
+// 0x20, accepted range 50..200). Two of its functions are hooked: the GraphicsConfig.ini loader
+// (startup) and the function that applies the settings (startup and every menu change). When the
+// scale is 50 it becomes 58 before the game uses it. The menu keeps showing 50 %.
+// Both functions are matched by their first bytes; another game build leaves them unhooked.
 // ------------------------------------------------------------------------------------------
 static const int kBalancedRatio = 58;
+static const uintptr_t kLoadSettingsRva = 0x7a7160, kApplySettingsRva = 0x7a7d30;
+static const uint8_t kLoadSettingsBytes[] = { 0x48, 0x8b, 0xc4, 0x55, 0x57, 0x41, 0x54, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8b, 0xec, 0x48, 0x83, 0xec, 0x70 };
+static const uint8_t kApplySettingsBytes[] = { 0x40, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8d, 0x6c, 0x24, 0xd9 };
 
-using PFN_NtCreateFile = LONG(NTAPI*)(HANDLE*, ACCESS_MASK, OBJECT_ATTRIBUTES*, IO_STATUS_BLOCK*, LARGE_INTEGER*, ULONG, ULONG, ULONG, ULONG, void*, ULONG);
-using PFN_NtOpenFile = LONG(NTAPI*)(HANDLE*, ACCESS_MASK, OBJECT_ATTRIBUTES*, IO_STATUS_BLOCK*, ULONG, ULONG);
-using PFN_NtReadFile = LONG(NTAPI*)(HANDLE, HANDLE, void*, void*, IO_STATUS_BLOCK*, void*, ULONG, LARGE_INTEGER*, ULONG*);
-static PFN_NtCreateFile o_NtCreateFile;
-static PFN_NtOpenFile o_NtOpenFile;
-static PFN_NtReadFile o_NtReadFile;
-static std::atomic<HANDLE> g_gfxConfig{nullptr};   // open read handle of GraphicsConfig.ini
+using PFN_LoadSettings = bool(__fastcall*)(void* settings, void* a, void* b);
+using PFN_ApplySettings = void(__fastcall*)(void* settings);
+static PFN_LoadSettings o_LoadSettings;
+static PFN_ApplySettings o_ApplySettings;
 
-static void TrackGfxConfig(LONG status, HANDLE* h, ACCESS_MASK access, OBJECT_ATTRIBUTES* oa)
+static void PreferBalanced(void* settings)
 {
-    static const wchar_t kName[] = L"\\GraphicsConfig.ini";
-    const USHORT n = (USHORT)(wcslen(kName) * sizeof(wchar_t));
-    if (status < 0 || !h || !(access & (GENERIC_READ | FILE_READ_DATA)) || !oa || !oa->ObjectName) return;
-    const UNICODE_STRING* s = oa->ObjectName;
-    if (s->Length < n || _wcsnicmp(s->Buffer + (s->Length - n) / sizeof(wchar_t), kName, n / sizeof(wchar_t))) return;
-    g_gfxConfig = *h;
+    int* ratio = (int*)((uint8_t*)settings + 0x20);
+    if (!settings || *ratio != 50) return;
+    *ratio = kBalancedRatio;
+    Log("Resolution scale 50%% set to %d%% (DLSS Balanced)", kBalancedRatio);
 }
 
-static LONG NTAPI Hk_NtCreateFile(HANDLE* h, ACCESS_MASK access, OBJECT_ATTRIBUTES* oa, IO_STATUS_BLOCK* io, LARGE_INTEGER* alloc,
-                                  ULONG attrs, ULONG share, ULONG disp, ULONG opts, void* ea, ULONG eaLen)
+static bool __fastcall Hk_LoadSettings(void* settings, void* a, void* b)
 {
-    LONG st = o_NtCreateFile(h, access, oa, io, alloc, attrs, share, disp, opts, ea, eaLen);
-    TrackGfxConfig(st, h, access, oa);
-    return st;
+    bool r = o_LoadSettings(settings, a, b);
+    PreferBalanced(settings);
+    return r;
 }
 
-static LONG NTAPI Hk_NtOpenFile(HANDLE* h, ACCESS_MASK access, OBJECT_ATTRIBUTES* oa, IO_STATUS_BLOCK* io, ULONG share, ULONG opts)
+static void __fastcall Hk_ApplySettings(void* settings)
 {
-    LONG st = o_NtOpenFile(h, access, oa, io, share, opts);
-    TrackGfxConfig(st, h, access, oa);
-    return st;
+    PreferBalanced(settings);
+    o_ApplySettings(settings);
 }
 
-static LONG NTAPI Hk_NtReadFile(HANDLE h, HANDLE ev, void* apc, void* apcCtx, IO_STATUS_BLOCK* io, void* buf, ULONG len,
-                                LARGE_INTEGER* ofs, ULONG* key)
+static void HookResolutionScale()
 {
-    LONG st = o_NtReadFile(h, ev, apc, apcCtx, io, buf, len, ofs, key);
-    if (h != g_gfxConfig.load(std::memory_order_relaxed) || !h) return st;
-    if (st != 0 || !io || !io->Information) { g_gfxConfig = nullptr; return st; }   // end of file, error or pending
-    static const char kKey[] = "RenderingResolutionRatio=";
-    const size_t k = sizeof(kKey) - 1;
-    char* b = (char*)buf; const size_t size = io->Information;
-    for (size_t i = 0; i + k + 2 <= size; ++i) {
-        if (memcmp(b + i, kKey, k)) continue;
-        char* v = b + i + k;
-        if (v[0] == '5' && v[1] == '0' && (i + k + 2 == size || !isdigit((unsigned char)v[2]))) {
-            v[0] = (char)('0' + kBalancedRatio / 10); v[1] = (char)('0' + kBalancedRatio % 10);
-            Log("GraphicsConfig.ini: resolution scale 50%% read as %d%% (DLSS Balanced)", kBalancedRatio);
-        }
-        g_gfxConfig = nullptr;
-        break;
-    }
-    return st;
-}
-
-static void HookGfxConfigReads()
-{
-    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-    const struct { const char* name; void* hook; void** orig; } hooks[] = {
-        { "NtCreateFile", (void*)Hk_NtCreateFile, (void**)&o_NtCreateFile },
-        { "NtOpenFile", (void*)Hk_NtOpenFile, (void**)&o_NtOpenFile },
-        { "NtReadFile", (void*)Hk_NtReadFile, (void**)&o_NtReadFile },
+    auto base = (uint8_t*)GetModuleHandleW(nullptr);
+    const struct { uintptr_t rva; const uint8_t* bytes; size_t n; void* hook; void** orig; const char* name; } hooks[] = {
+        { kLoadSettingsRva, kLoadSettingsBytes, sizeof(kLoadSettingsBytes), (void*)Hk_LoadSettings, (void**)&o_LoadSettings, "settings loader" },
+        { kApplySettingsRva, kApplySettingsBytes, sizeof(kApplySettingsBytes), (void*)Hk_ApplySettings, (void**)&o_ApplySettings, "settings apply" },
     };
+    const DWORD imageSize = ((IMAGE_NT_HEADERS*)(base + ((IMAGE_DOS_HEADER*)base)->e_lfanew))->OptionalHeader.SizeOfImage;
     if (!MinHookReady()) { Log("ERROR: MinHook initialisation failed"); return; }
+    for (auto& h : hooks)
+        if (h.rva + h.n > imageSize || memcmp(base + h.rva, h.bytes, h.n)) { Log("Game %s not found (other game build); 50%% resolution scale stays 50%%", h.name); return; }
     for (auto& h : hooks) {
-        void* fn = (void*)GetProcAddress(ntdll, h.name);
-        MH_STATUS st = fn ? MH_CreateHook(fn, h.hook, h.orig) : MH_ERROR_FUNCTION_NOT_FOUND;
-        if (st == MH_OK) st = MH_EnableHook(fn);
-        if (st != MH_OK) { Log("Detour of %s failed: %s; 50%% resolution scale stays 50%%", h.name, MH_StatusToString(st)); return; }
+        MH_STATUS st = MH_CreateHook(base + h.rva, h.hook, h.orig);
+        if (st == MH_OK) st = MH_EnableHook(base + h.rva);
+        if (st != MH_OK) { Log("Detour of game %s failed: %s", h.name, MH_StatusToString(st)); return; }
     }
 }
 
@@ -2002,7 +1978,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)
 
     if (!HookExeImport("kernel32.dll", "GetProcAddress", (void*)Hk_GetProcAddress, (void**)&o_GetProcAddress))
         Log("ERROR: could not hook GetProcAddress import");
-    if (g_cfg.replaceTaa) HookGfxConfigReads();   // before the game reads its settings
+    if (g_cfg.replaceTaa) HookResolutionScale();   // before the game reads its settings
     if (HANDLE t = CreateThread(nullptr, 0, HookThread, nullptr, 0, nullptr)) CloseHandle(t);
     return TRUE;
 }
