@@ -1,0 +1,12 @@
+# Build output
+build/
+*.obj
+*.exp
+*.ilk
+*.pdb
+*.exe
+*.dll
+
+# Runtime logs and dumps
+*.log
+FFXV_DLSS4_*.asm
